@@ -21,8 +21,8 @@ Requires [Go 1.16+](https://golang.org/dl/)
 ```bash
 git clone https://github.com/yourusername/bar-relay.git
 cd bar-relay
-go build -o bar-relay.exe  # Windows
-go build -o bar-relay      # Linux/macOS
+go build -o bar-relay.exe main.go  # Windows
+go build -o bar-relay main.go     # Linux/macOS
 ```
 
 ## Configuration
