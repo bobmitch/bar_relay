@@ -14,12 +14,6 @@ This relay sits between the Beyond All Reason game client and a web API, capturi
 2. Extract `bar-relay.exe` to a folder of your choice (e.g., `C:\Program Files\BAR-Relay\`)
 3. Run `bar-relay.exe` - you'll be prompted for your UUID on first launch
 
-### Linux/macOS
-
-1. Download the appropriate binary for your platform from [Releases](../../releases)
-2. Make it executable: `chmod +x bar-relay`
-3. Run: `./bar-relay`
-
 ### Building from Source
 
 Requires [Go 1.16+](https://golang.org/dl/)
@@ -176,7 +170,7 @@ Incoming events from BAR are standard JSON. The relay adds a `uuid` field:
 
 ## License
 
-[Your License Here]
+MIT
 
 ## Contributing
 
