@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -130,18 +131,39 @@ func handleConnection(conn net.Conn) {
 }
 
 func relayToAPI(jsonData string) {
-	// Create a new request manually to add headers
-	req, err := http.NewRequest("POST", apiUrl, bytes.NewBufferString(jsonData))
+	// Parse the incoming JSON
+	var payload map[string]interface{}
+	err := json.Unmarshal([]byte(jsonData), &payload)
+	if err != nil {
+		fmt.Printf("JSON Parse Error: %v\n", err)
+		return
+	}
+
+	// Add the token as a property in the JSON
+	if token != "" {
+		payload["token"] = token
+	}
+
+	// Marshal back to JSON
+	modifiedJSON, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Printf("JSON Marshal Error: %v\n", err)
+		return
+	}
+
+	if verbose {
+		fmt.Printf("Sending: %s\n", string(modifiedJSON))
+	}
+
+	// Create a new request
+	req, err := http.NewRequest("POST", apiUrl, bytes.NewBuffer(modifiedJSON))
 	if err != nil {
 		fmt.Printf("Request Creation Error: %v\n", err)
 		return
 	}
 
-	// Set Headers
+	// Set Content-Type header
 	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
 
 	resp, err := apiClient.Do(req)
 	if err != nil {
