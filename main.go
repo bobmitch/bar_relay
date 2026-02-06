@@ -26,7 +26,7 @@ var (
 	host    string
 	port    string
 	apiUrl  string
-	token   string // <--- New variable for the JWT
+	uuid    string
 	verbose bool
 	reset   bool
 )
@@ -35,19 +35,19 @@ var apiClient = &http.Client{
 	Timeout: 10 * time.Second,
 }
 
-const configFileName = ".bar_token"
+const configFileName = ".bar_uuid"
 
 func init() {
 	flag.StringVar(&host, "host", defaultHost, "The IP address to listen on")
 	flag.StringVar(&port, "port", defaultPort, "The TCP port to listen on")
 	flag.StringVar(&apiUrl, "url", defaultAPIUrl, "The destination Web API URL")
-	flag.StringVar(&token, "token", "", "Your Personal Access Token from the web app") // <--- New Flag
+	flag.StringVar(&uuid, "uuid", "", "Your UUID from the web app")
 	flag.BoolVar(&verbose, "v", defaultVerbose, "Enable detailed logging")
-	flag.BoolVar(&reset, "reset", false, "Clear the stored token and prompt for a new one") // <--- Moved here
+	flag.BoolVar(&reset, "reset", false, "Clear the stored UUID and prompt for a new one")
 }
 
-func getToken() string {
-	// 1. Try to find the token in the home directory
+func getUUID() string {
+	// 1. Try to find the UUID in the home directory
 	home, _ := os.UserHomeDir()
 	configPath := filepath.Join(home, configFileName)
 
@@ -57,19 +57,19 @@ func getToken() string {
 	}
 
 	// 2. If not found, ask the user interactively
-	fmt.Print("No token found. Please paste your Personal Access Token: ")
+	fmt.Print("No UUID found. Please paste your UUID: ")
 	reader := bufio.NewReader(os.Stdin)
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSpace(input)
 
 	if input == "" {
-		fmt.Println("Error: Token cannot be empty.")
+		fmt.Println("Error: UUID cannot be empty.")
 		os.Exit(1)
 	}
 
 	// 3. Save it for next time
 	os.WriteFile(configPath, []byte(input), 0600) // 0600 = Read/Write for owner only
-	fmt.Printf("Token saved to %s\n", configPath)
+	fmt.Printf("UUID saved to %s\n", configPath)
 	
 	return input
 }
@@ -80,12 +80,12 @@ func main() {
 	if reset {
 		home, _ := os.UserHomeDir()
 		os.Remove(filepath.Join(home, configFileName))
-		fmt.Println("Stored token cleared.")
+		fmt.Println("Stored UUID cleared.")
 	}
 
-	// Logic: If -token flag is provided, use it. Otherwise, use stored/interactive.
-	if token == "" {
-		token = getToken()
+	// Logic: If -uuid flag is provided, use it. Otherwise, use stored/interactive.
+	if uuid == "" {
+		uuid = getUUID()
 	}
 
 
@@ -139,9 +139,9 @@ func relayToAPI(jsonData string) {
 		return
 	}
 
-	// Add the token as a property in the JSON
-	if token != "" {
-		payload["token"] = token
+	// Add the UUID as a property in the JSON
+	if uuid != "" {
+		payload["uuid"] = uuid
 	}
 
 	// Marshal back to JSON
