@@ -114,20 +114,29 @@ func main() {
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
-	
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil {
-		fmt.Printf("Read error: %v\n", err)
-		return
+	fmt.Printf("New connection from: %s\n", conn.RemoteAddr())
+
+	// Use a scanner to read line by line (since Lua adds \n)
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		jsonData := scanner.Text()
+		
+		if verbose {
+			fmt.Printf("Received: %s\n", jsonData)
+		}
+		
+		// Run the relay in a goroutine so the socket isn't blocked 
+		// by slow web API responses
+		go relayToAPI(jsonData)
+		
+		// Optional: Send an "OK" back to Lua so it knows we got it
+		conn.Write([]byte("ACK\n"))
 	}
-	
-	jsonData := string(buf[:n])
-	if verbose {
-		fmt.Printf("Received: %s\n", jsonData)
+
+	if err := scanner.Err(); err != nil {
+		fmt.Printf("Connection error: %v\n", err)
 	}
-	
-	relayToAPI(jsonData)
+	fmt.Printf("Connection closed for: %s\n", conn.RemoteAddr())
 }
 
 func relayToAPI(jsonData string) {
