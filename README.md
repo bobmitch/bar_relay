@@ -11,7 +11,7 @@ A high-performance Go-based relay for **Beyond All Reason (BAR)**. This tool acc
 * **Resilience**: Implements a **60-second Retry Buffer**. If the API is down, data is cached and retried, but stale data (>60s) is dropped to prevent outdated audio/visual cues.
 * **Live Stats**: Real-time terminal tracking of events, requests sent, and KB throughput.
 
-## 🛠 Installation
+## 🛠 Manual Build
 
 1. Ensure you have [Go](https://go.dev/dl/) installed.
 2. Clone this repository or save `main.go`.
@@ -93,6 +93,3 @@ Pressing `Ctrl+C` will trigger a **Final Session Summary**, showing:
 * Total data transferred in KB.
 * Number of events dropped due to API downtime > 60s.
 
----
-
-Would you like me to help you set up a **GitHub Action** so that this binary is automatically compiled for Windows, Mac, and Linux every time you push code?
