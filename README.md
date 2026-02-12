@@ -1,8 +1,3 @@
-This is a perfect way to wrap up the project. A solid README makes it much easier to jump back into the code a few months from now without having to dig through the source to remember the flags.
-
-I have included a section on the **Batching Logic**, the **60s Retry Buffer**, and the **Replay Speed** functionality.
-
----
 
 # BAR Event Relay & Recorder
 
