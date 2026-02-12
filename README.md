@@ -1,182 +1,103 @@
-# BAR Event Relay
+This is a perfect way to wrap up the project. A solid README makes it much easier to jump back into the code a few months from now without having to dig through the source to remember the flags.
 
-A lightweight TCP relay server for [Beyond All Reason](https://www.beyondallreason.info/) that forwards in-game JSON events to a web-based announcer application.
+I have included a section on the **Batching Logic**, the **60s Retry Buffer**, and the **Replay Speed** functionality.
 
-## Overview
+---
 
-This relay sits between the Beyond All Reason game client and a web API, capturing game events (kills, deaths, objectives, etc.) and forwarding them to your custom announcer web app for real-time commentary and effects.
+# BAR Event Relay & Recorder
 
-## Installation
+A high-performance Go-based relay for **Beyond All Reason (BAR)**. This tool accepts JSON events from the game via TCP, batches them intelligently to save bandwidth, and relays them to a web API. It also features a session recorder and a time-accurate replayer.
 
-### Windows (Recommended)
+## 🚀 Features
 
-1. Download the latest release from the [Releases](../../releases) page
-2. Extract `bar-relay.exe` to a folder of your choice (e.g., `C:\Program Files\BAR-Relay\`)
-3. Run `bar-relay.exe` - you'll be prompted for your UUID on first launch
+* **Intelligent Batching**: Groups rapid-fire game events into single HTTP requests using soft (100ms) and hard (250ms) timeouts.
+* **Session Recording**: Saves game events to `.jsonl` format with high-precision timestamps.
+* **Smart Replay**: Play back recorded sessions at **1x** or **2x+** speeds with original timing preserved.
+* **Resilience**: Implements a **60-second Retry Buffer**. If the API is down, data is cached and retried, but stale data (>60s) is dropped to prevent outdated audio/visual cues.
+* **Live Stats**: Real-time terminal tracking of events, requests sent, and KB throughput.
 
-### Building from Source
+## 🛠 Installation
 
-Requires [Go 1.16+](https://golang.org/dl/)
+1. Ensure you have [Go](https://go.dev/dl/) installed.
+2. Clone this repository or save `main.go`.
+3. Build the binary:
+```bash
+go build -o bar-relay main.go
+
+```
+
+
+
+## 📖 Usage
+
+### Basic Relay
+
+Start the relay with your UUID. It will listen on `127.0.0.1:5005` by default.
 
 ```bash
-git clone https://github.com/yourusername/bar-relay.git
-cd bar-relay
-go build -o bar-relay.exe main.go  # Windows
-go build -o bar-relay main.go     # Linux/macOS
-```
-
-## Configuration
-
-### Getting Your UUID
-
-1. Visit the announcer web app at [https://barapi.bobmitch.com](https://barapi.bobmitch.com) (or your custom instance)
-2. Copy your unique UUID from the dashboard
-3. On first run, paste it when prompted
-
-The UUID is automatically saved to `~/.bar_uuid` for future sessions.
-
-### Command Line Options
+./bar-relay -uuid YOUR_UUID_HERE
 
 ```
-bar-relay [options]
 
-Options:
-  -host string
-        The IP address to listen on (default "127.0.0.1")
-  -port string
-        The TCP port to listen on (default "5005")
-  -url string
-        The destination Web API URL (default "https://barapi.bobmitch.com/push")
-  -uuid string
-        Your UUID from the web app (overrides saved UUID)
-  -v    Enable detailed logging
-  -reset
-        Clear the stored UUID and prompt for a new one
-```
+### Recording Sessions
 
-### Examples
-
-**Basic usage** (uses saved UUID):
-```cmd
-bar-relay.exe
-```
-
-**Custom port**:
-```cmd
-bar-relay.exe -port 8080
-```
-
-**Verbose logging** (useful for debugging):
-```cmd
-bar-relay.exe -v
-```
-
-**One-time UUID override**:
-```cmd
-bar-relay.exe -uuid your-uuid-here
-```
-
-**Reset stored UUID**:
-```cmd
-bar-relay.exe -reset
-```
-
-## Game Configuration
-
-Configure Beyond All Reason to send events to the relay:
-
-1. Open your BAR game settings
-2. Navigate to the event output configuration
-3. Set the target to `127.0.0.1:5005` (or your custom host/port)
-4. Enable event streaming
-
-## How It Works
-
-1. **Game Events**: BAR sends JSON-formatted game events to the relay via TCP
-2. **UUID Injection**: The relay adds your UUID to each event
-3. **API Forward**: Events are forwarded to the web API via HTTP POST
-4. **Web App**: Your announcer web app receives and processes the events in real-time
-
-```
-[BAR Game] --TCP--> [Relay] --HTTPS--> [Web API] --WebSocket--> [Announcer App]
-            JSON              JSON+UUID              Real-time
-```
-
-## Troubleshooting
-
-**"No UUID found" on every launch**
-- Run with `-reset` to clear any corrupted UUID file
-- Manually create `~/.bar_uuid` with your UUID (Windows: `%USERPROFILE%\.bar_uuid`)
-
-**Events not appearing in web app**
-- Verify the relay is running (`--- BAR Relay Active ---` message)
-- Check game configuration points to correct host/port
-- Enable verbose mode with `-v` to see incoming events
-- Verify UUID matches your web app dashboard
-
-**Connection refused errors**
-- Ensure no other application is using port 5005
-- Check Windows Firewall isn't blocking the relay
-- Try a different port with `-port 8080`
-
-**API errors (4xx/5xx responses)**
-- Verify your UUID is correct
-- Check internet connectivity
-- Confirm API URL is accessible
-
-## Advanced Usage
-
-### Running as a Windows Service
-
-For persistent background operation, use [NSSM](https://nssm.cc/):
-
-```cmd
-nssm install BARRelay "C:\Program Files\BAR-Relay\bar-relay.exe"
-nssm set BARRelay AppDirectory "C:\Program Files\BAR-Relay"
-nssm start BARRelay
-```
-
-### Custom API Endpoint
-
-If hosting your own announcer backend:
-
-```cmd
-bar-relay.exe -url https://your-api.example.com/events
-```
-
-## Development
-
-### Testing Locally
-
-Send a test event:
+Use the `-record` flag to save your session.
 
 ```bash
-echo '{"event":"kill","player":"TestPlayer"}' | nc localhost 5005
+# Auto-generate a filename based on the current timestamp
+./bar-relay -record auto
+
+# Or specify a custom filename
+./bar-relay -record my_game_session.jsonl
+
 ```
 
-### Event Format
+### Replaying Sessions
 
-Incoming events from BAR are standard JSON. The relay adds a `uuid` field:
+Feed a recorded file back through the relay logic (and to the API).
 
-```json
-{
-  "event": "kill",
-  "player": "PlayerName",
-  "victim": "EnemyName",
-  "timestamp": 123456,
-  "uuid": "your-uuid-here"
-}
+```bash
+# Normal speed
+./bar-relay -replay session_2026-02-11.jsonl
+
+# 2x Speed
+./bar-relay -replay session_2026-02-11.jsonl -speed 2.0
+
 ```
 
-## License
+## ⚙️ Configuration Flags
 
-MIT
+| Flag | Default | Description |
+| --- | --- | --- |
+| `-host` | `127.0.0.1` | The IP address to listen on. |
+| `-port` | `5005` | The TCP port to listen on. |
+| `-url` | `.../push` | The destination Web API URL. |
+| `-uuid` | `""` | Your unique identifier (stored in `.bar_uuid`). |
+| `-record` | `""` | File path to record (`auto` for timestamped names). |
+| `-replay` | `""` | File path of a session to play back. |
+| `-speed` | `1.0` | Playback speed multiplier (e.g., `2.0`, `0.5`). |
+| `-v` | `false` | Enable verbose logging for debugging. |
+| `-reset` | `false` | Clear the stored UUID and prompt for a new one. |
 
-## Contributing
+## 📊 Performance & Reliability
 
-Contributions welcome! Please open an issue or submit a pull request.
+### Batching Logic
 
-## Support
+The relay uses a dual-timer approach:
 
-- **Issues**: [GitHub Issues](../../issues)
-- **BAR Community**: [Beyond All Reason Discord](https://discord.gg/beyond-all-reason)
+1. **Soft Timeout (100ms)**: If a single event arrives and nothing follows, it sends immediately.
+2. **Hard Timeout (250ms)**: If events are flooding in, it forces a batch send every quarter-second to maintain a balance between "real-time" feel and server efficiency.
+
+### Graceful Shutdown
+
+Pressing `Ctrl+C` will trigger a **Final Session Summary**, showing:
+
+* Total session duration.
+* Total events processed.
+* Actual HTTP requests made (efficiency tracking).
+* Total data transferred in KB.
+* Number of events dropped due to API downtime > 60s.
+
+---
+
+Would you like me to help you set up a **GitHub Action** so that this binary is automatically compiled for Windows, Mac, and Linux every time you push code?
