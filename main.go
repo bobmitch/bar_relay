@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -216,7 +215,6 @@ func (b *EventBatcher) sendToAPI(payload []byte) {
 	}
 }
 
-// PrintFinalSummary displays the grand totals
 func (b *EventBatcher) PrintFinalSummary() {
 	duration := time.Since(b.startTime).Round(time.Second)
 	kbSent := float64(b.totalBytes) / 1024.0
@@ -308,7 +306,6 @@ func main() {
 
 	batcher := NewEventBatcher(uuid, apiUrl, verbose, recordFile)
 
-	// --- Signal Handling for Graceful Shutdown ---
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
