@@ -37,14 +37,22 @@ var (
 )
 
 var apiClient = &http.Client{
-	Timeout: 10 * time.Second,
+	Timeout: 5 * time.Second, // Reduced timeout for faster failover
 }
 
-const configFileName = ".bar_uuid"
+const (
+	configFileName = ".bar_uuid"
+	maxRetryAge    = 60 * time.Second
+)
 
 type RecordedEvent struct {
 	Timestamp time.Time              `json:"t"`
 	Data      map[string]interface{} `json:"d"`
+}
+
+type retryItem struct {
+	payload   []byte
+	timestamp time.Time
 }
 
 type EventBatcher struct {
@@ -69,10 +77,15 @@ type EventBatcher struct {
 	totalEvents   int64
 	totalRequests int64
 	totalBytes    int64
+	droppedEvents int64
 
 	// Recording fields
 	recorder *json.Encoder
 	recordMu sync.Mutex
+
+	// Retry Queue
+	retryQueue []retryItem
+	retryMu    sync.Mutex
 }
 
 func NewEventBatcher(uuid, apiUrl string, verbose bool, recordPath string) *EventBatcher {
@@ -85,13 +98,13 @@ func NewEventBatcher(uuid, apiUrl string, verbose bool, recordPath string) *Even
 		apiClient:   apiClient,
 		verbose:     verbose,
 		startTime:   time.Now(),
+		retryQueue:  make([]retryItem, 0),
 	}
 
 	if recordPath != "" {
 		if recordPath == "auto" {
 			recordPath = fmt.Sprintf("session_%s.jsonl", time.Now().Format("2006-01-02_15-04-05"))
 		}
-
 		f, err := os.OpenFile(recordPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			fmt.Printf("⚠️  Failed to open record file: %v\n", err)
@@ -101,7 +114,50 @@ func NewEventBatcher(uuid, apiUrl string, verbose bool, recordPath string) *Even
 		}
 	}
 
+	// Start background retry worker
+	go eb.retryWorker()
+
 	return eb
+}
+
+func (b *EventBatcher) retryWorker() {
+	for {
+		time.Sleep(5 * time.Second) // Check every 5s
+
+		b.retryMu.Lock()
+		if len(b.retryQueue) == 0 {
+			b.retryMu.Unlock()
+			continue
+		}
+
+		// Filter out stale items
+		var validItems []retryItem
+		now := time.Now()
+		for _, item := range b.retryQueue {
+			if now.Sub(item.timestamp) < maxRetryAge {
+				validItems = append(validItems)
+			} else {
+				b.mu.Lock()
+				b.droppedEvents++
+				b.mu.Unlock()
+			}
+		}
+		b.retryQueue = validItems
+
+		if len(b.retryQueue) > 0 {
+			// Grab the first one to try
+			item := b.retryQueue[0]
+			b.retryQueue = b.retryQueue[1:]
+			b.retryMu.Unlock()
+
+			if b.verbose {
+				fmt.Printf("\n🔄 Attempting retry of buffered payload (%s old)\n", now.Sub(item.timestamp).Round(time.Second))
+			}
+			b.sendToAPI(item.payload, true)
+		} else {
+			b.retryMu.Unlock()
+		}
+	}
 }
 
 func (b *EventBatcher) Add(eventJSON string) {
@@ -117,10 +173,7 @@ func (b *EventBatcher) Add(eventJSON string) {
 
 	if b.recorder != nil {
 		b.recordMu.Lock()
-		b.recorder.Encode(RecordedEvent{
-			Timestamp: time.Now(),
-			Data:      event,
-		})
+		b.recorder.Encode(RecordedEvent{Timestamp: time.Now(), Data: event})
 		b.recordMu.Unlock()
 	}
 
@@ -172,7 +225,6 @@ func (b *EventBatcher) onHardTimeout() {
 
 func (b *EventBatcher) flushUnsafe() {
 	if len(b.buffer) == 0 { return }
-
 	if b.idleTimer != nil { b.idleTimer.Stop(); b.idleTimer = nil }
 	if b.batchTimer != nil { b.batchTimer.Stop(); b.batchTimer = nil }
 
@@ -185,34 +237,40 @@ func (b *EventBatcher) flushUnsafe() {
 		payload, _ = json.Marshal(b.buffer)
 	}
 
-	b.sendToAPI(payload)
+	b.sendToAPI(payload, false)
 	b.buffer = make([]map[string]interface{}, 0)
 	b.isInBatchMode = false
 
-	// Pulse Log
 	kbSent := float64(b.totalBytes) / 1024.0
 	fmt.Printf("\r🚀 [Relay] Events: %-6d | Requests: %-4d | Sent: %-7.2f KB", 
 		b.totalEvents, b.totalRequests, kbSent)
 }
 
-func (b *EventBatcher) sendToAPI(payload []byte) {
+func (b *EventBatcher) sendToAPI(payload []byte, isRetry bool) {
 	req, err := http.NewRequest("POST", b.apiUrl, bytes.NewBuffer(payload))
 	if err != nil { return }
 	req.Header.Set("Content-Type", "application/json")
 	
 	resp, err := b.apiClient.Do(req)
-	b.totalRequests++
-	b.totalBytes += int64(len(payload))
-
-	if err != nil {
-		fmt.Printf("\n❌ API Error: %v\n", err)
+	
+	if err != nil || resp.StatusCode >= 400 {
+		if !isRetry {
+			b.retryMu.Lock()
+			b.retryQueue = append(b.retryQueue, retryItem{payload: payload, timestamp: time.Now()})
+			b.retryMu.Unlock()
+			if b.verbose {
+				fmt.Printf("\n⚠️  API failed. Payload buffered for retry (60s TTL).\n")
+			}
+		}
+		if resp != nil { resp.Body.Close() }
 		return
 	}
 	defer resp.Body.Close()
 
-	if b.verbose {
-		fmt.Printf("\n[Verbose] Payload: %d bytes | Status: %d\n", len(payload), resp.StatusCode)
-	}
+	b.mu.Lock()
+	b.totalRequests++
+	b.totalBytes += int64(len(payload))
+	b.mu.Unlock()
 }
 
 func (b *EventBatcher) PrintFinalSummary() {
@@ -224,6 +282,9 @@ func (b *EventBatcher) PrintFinalSummary() {
 	fmt.Printf("📈 Total Events: %d\n", b.totalEvents)
 	fmt.Printf("🌐 API Requests: %d\n", b.totalRequests)
 	fmt.Printf("💾 Total Sent:   %.2f KB\n", kbSent)
+	if b.droppedEvents > 0 {
+		fmt.Printf("🗑️  Dropped:      %d events (stale >60s)\n", b.droppedEvents)
+	}
 	fmt.Println("--------------------------------")
 }
 
@@ -235,7 +296,7 @@ func ReplaySession(filePath string, batcher *EventBatcher, speed float64) {
 	}
 	defer f.Close()
 
-	fmt.Printf("▶️  Replaying: %s (%.1fx speed)\n", filePath, speed)
+	fmt.Printf("▶️  Replaying: %s (%.1fx)\n", filePath, speed)
 	scanner := bufio.NewScanner(f)
 	var lastTime time.Time
 
@@ -246,8 +307,7 @@ func ReplaySession(filePath string, batcher *EventBatcher, speed float64) {
 			delay := rec.Timestamp.Sub(lastTime)
 			time.Sleep(time.Duration(float64(delay) / speed))
 		}
-		dataStr, _ := json.Marshal(rec.Data)
-		batcher.Add(string(dataStr))
+		batcher.Add(string(scanner.Bytes())) // Re-using data
 		lastTime = rec.Timestamp
 	}
 	fmt.Println("\n🏁 Replay finished.")
@@ -295,13 +355,11 @@ func init() {
 
 func main() {
 	flag.Parse()
-
 	if reset {
 		home, _ := os.UserHomeDir()
 		os.Remove(filepath.Join(home, configFileName))
 		fmt.Println("UUID Reset.")
 	}
-
 	if uuid == "" { uuid = getUUID() }
 
 	batcher := NewEventBatcher(uuid, apiUrl, verbose, recordFile)
