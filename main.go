@@ -281,3 +281,50 @@ func main() {
 	// Shutdown handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		batcher.PrintFinalSummary()
+		os.Exit(0)
+	}()
+
+	if replayFile != "" {
+		go func() {
+			f, _ := os.Open(replayFile)
+			defer f.Close()
+			scanner := bufio.NewScanner(f)
+			var last time.Time
+			for scanner.Scan() {
+				var rec RecordedEvent
+				json.Unmarshal(scanner.Bytes(), &rec)
+				if !last.IsZero() {
+					time.Sleep(time.Duration(float64(rec.Timestamp.Sub(last)) / replaySpeed))
+				}
+				raw, _ := json.Marshal(rec.Data)
+				batcher.Add(string(raw))
+				last = rec.Timestamp
+			}
+			fmt.Println("\n🏁 Replay finished.")
+		}()
+	}
+
+	addr := net.JoinHostPort(host, port)
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Printf("❌ Fatal: %v\n", err)
+		return
+	}
+	fmt.Printf("📡 BAR Relay: %s\n", addr)
+	for {
+		conn, err := l.Accept()
+		if err == nil {
+			go func(c net.Conn) {
+				defer c.Close()
+				s := bufio.NewScanner(c)
+				for s.Scan() {
+					batcher.Add(s.Text())
+					c.Write([]byte("ACK\n"))
+				}
+			}(conn)
+		}
+	}
+}
