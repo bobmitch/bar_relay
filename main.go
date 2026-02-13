@@ -37,7 +37,7 @@ var (
 )
 
 var apiClient = &http.Client{
-	Timeout: 5 * time.Second, // Reduced timeout for faster failover
+	Timeout: 5 * time.Second,
 }
 
 const (
@@ -61,8 +61,7 @@ type EventBatcher struct {
 	idleTimer  *time.Timer
 	batchTimer *time.Timer
 
-	firstEventTime time.Time
-	isInBatchMode  bool
+	isInBatchMode bool
 
 	softTimeout time.Duration
 	hardTimeout time.Duration
@@ -72,14 +71,14 @@ type EventBatcher struct {
 	apiClient *http.Client
 	verbose   bool
 
-	// Stats counters
+	// Stats
 	startTime     time.Time
 	totalEvents   int64
 	totalRequests int64
 	totalBytes    int64
 	droppedEvents int64
 
-	// Recording fields
+	// Recording
 	recorder *json.Encoder
 	recordMu sync.Mutex
 
@@ -114,28 +113,24 @@ func NewEventBatcher(uuid, apiUrl string, verbose bool, recordPath string) *Even
 		}
 	}
 
-	// Start background retry worker
 	go eb.retryWorker()
-
 	return eb
 }
 
 func (b *EventBatcher) retryWorker() {
 	for {
-		time.Sleep(5 * time.Second) // Check every 5s
-
+		time.Sleep(5 * time.Second)
 		b.retryMu.Lock()
 		if len(b.retryQueue) == 0 {
 			b.retryMu.Unlock()
 			continue
 		}
 
-		// Filter out stale items
 		var validItems []retryItem
 		now := time.Now()
 		for _, item := range b.retryQueue {
 			if now.Sub(item.timestamp) < maxRetryAge {
-				validItems = append(validItems)
+				validItems = append(validItems, item)
 			} else {
 				b.mu.Lock()
 				b.droppedEvents++
@@ -145,14 +140,9 @@ func (b *EventBatcher) retryWorker() {
 		b.retryQueue = validItems
 
 		if len(b.retryQueue) > 0 {
-			// Grab the first one to try
 			item := b.retryQueue[0]
 			b.retryQueue = b.retryQueue[1:]
 			b.retryMu.Unlock()
-
-			if b.verbose {
-				fmt.Printf("\n🔄 Attempting retry of buffered payload (%s old)\n", now.Sub(item.timestamp).Round(time.Second))
-			}
 			b.sendToAPI(item.payload, true)
 		} else {
 			b.retryMu.Unlock()
@@ -163,13 +153,13 @@ func (b *EventBatcher) retryWorker() {
 func (b *EventBatcher) Add(eventJSON string) {
 	var event map[string]interface{}
 	if err := json.Unmarshal([]byte(eventJSON), &event); err != nil {
-		fmt.Printf("\nError parsing event JSON: %v\n", err)
 		return
 	}
 
 	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	b.totalEvents++
-	b.mu.Unlock()
 
 	if b.recorder != nil {
 		b.recordMu.Lock()
@@ -177,31 +167,21 @@ func (b *EventBatcher) Add(eventJSON string) {
 		b.recordMu.Unlock()
 	}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if len(b.buffer) == 0 {
-		b.firstEventTime = time.Now()
-		b.isInBatchMode = false
-		b.buffer = append(b.buffer, event)
-		if b.idleTimer != nil { b.idleTimer.Stop() }
-		b.idleTimer = time.AfterFunc(b.softTimeout, b.onSoftTimeout)
-		return
-	}
-
 	b.buffer = append(b.buffer, event)
 
-	if !b.isInBatchMode && time.Since(b.firstEventTime) < b.softTimeout {
-		if len(b.buffer) >= 2 {
-			b.isInBatchMode = true
-			if b.idleTimer != nil { b.idleTimer.Stop() }
+	// If this is the very first event in a new batch
+	if len(b.buffer) == 1 {
+		b.isInBatchMode = false
+		if b.idleTimer != nil { b.idleTimer.Stop() }
+		b.idleTimer = time.AfterFunc(b.softTimeout, b.onSoftTimeout)
+	} else if !b.isInBatchMode {
+		// Second event arrived within the soft window
+		b.isInBatchMode = true
+		if b.idleTimer != nil { b.idleTimer.Stop() }
+		// FIXED: Only start the hard timer ONCE per batch. Do not reset it.
+		if b.batchTimer == nil {
 			b.batchTimer = time.AfterFunc(b.hardTimeout, b.onHardTimeout)
 		}
-	}
-
-	if b.isInBatchMode {
-		if b.batchTimer != nil { b.batchTimer.Stop() }
-		b.batchTimer = time.AfterFunc(b.hardTimeout, b.onHardTimeout)
 	}
 }
 
@@ -209,22 +189,26 @@ func (b *EventBatcher) onSoftTimeout() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if len(b.buffer) == 0 { return }
+	
 	if len(b.buffer) == 1 {
 		b.flushUnsafe()
-		return
+	} else {
+		b.isInBatchMode = true
+		if b.batchTimer == nil {
+			b.batchTimer = time.AfterFunc(b.hardTimeout, b.onHardTimeout)
+		}
 	}
-	b.isInBatchMode = true
-	b.batchTimer = time.AfterFunc(b.hardTimeout, b.onHardTimeout)
 }
 
 func (b *EventBatcher) onHardTimeout() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.buffer) > 0 { b.flushUnsafe() }
+	b.flushUnsafe()
 }
 
 func (b *EventBatcher) flushUnsafe() {
 	if len(b.buffer) == 0 { return }
+
 	if b.idleTimer != nil { b.idleTimer.Stop(); b.idleTimer = nil }
 	if b.batchTimer != nil { b.batchTimer.Stop(); b.batchTimer = nil }
 
@@ -237,7 +221,8 @@ func (b *EventBatcher) flushUnsafe() {
 		payload, _ = json.Marshal(b.buffer)
 	}
 
-	b.sendToAPI(payload, false)
+	go b.sendToAPI(payload, false)
+
 	b.buffer = make([]map[string]interface{}, 0)
 	b.isInBatchMode = false
 
@@ -252,15 +237,11 @@ func (b *EventBatcher) sendToAPI(payload []byte, isRetry bool) {
 	req.Header.Set("Content-Type", "application/json")
 	
 	resp, err := b.apiClient.Do(req)
-	
-	if err != nil || resp.StatusCode >= 400 {
+	if err != nil || (resp != nil && resp.StatusCode >= 400) {
 		if !isRetry {
 			b.retryMu.Lock()
 			b.retryQueue = append(b.retryQueue, retryItem{payload: payload, timestamp: time.Now()})
 			b.retryMu.Unlock()
-			if b.verbose {
-				fmt.Printf("\n⚠️  API failed. Payload buffered for retry (60s TTL).\n")
-			}
 		}
 		if resp != nil { resp.Body.Close() }
 		return
@@ -276,41 +257,34 @@ func (b *EventBatcher) sendToAPI(payload []byte, isRetry bool) {
 func (b *EventBatcher) PrintFinalSummary() {
 	duration := time.Since(b.startTime).Round(time.Second)
 	kbSent := float64(b.totalBytes) / 1024.0
-
 	fmt.Println("\n\n--- 🏁 Final Session Summary ---")
 	fmt.Printf("⏱️  Duration:     %v\n", duration)
 	fmt.Printf("📈 Total Events: %d\n", b.totalEvents)
 	fmt.Printf("🌐 API Requests: %d\n", b.totalRequests)
 	fmt.Printf("💾 Total Sent:   %.2f KB\n", kbSent)
 	if b.droppedEvents > 0 {
-		fmt.Printf("🗑️  Dropped:      %d events (stale >60s)\n", b.droppedEvents)
+		fmt.Printf("🗑️  Dropped:      %d events (stale)\n", b.droppedEvents)
 	}
 	fmt.Println("--------------------------------")
 }
 
 func ReplaySession(filePath string, batcher *EventBatcher, speed float64) {
 	f, err := os.Open(filePath)
-	if err != nil {
-		fmt.Printf("\nReplay Error: %v\n", err)
-		return
-	}
+	if err != nil { return }
 	defer f.Close()
 
-	fmt.Printf("▶️  Replaying: %s (%.1fx)\n", filePath, speed)
 	scanner := bufio.NewScanner(f)
 	var lastTime time.Time
-
 	for scanner.Scan() {
 		var rec RecordedEvent
-		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil { continue }
+		json.Unmarshal(scanner.Bytes(), &rec)
 		if !lastTime.IsZero() {
-			delay := rec.Timestamp.Sub(lastTime)
-			time.Sleep(time.Duration(float64(delay) / speed))
+			time.Sleep(time.Duration(float64(rec.Timestamp.Sub(lastTime)) / speed))
 		}
-		batcher.Add(string(scanner.Bytes())) // Re-using data
+		raw, _ := json.Marshal(rec.Data)
+		batcher.Add(string(raw))
 		lastTime = rec.Timestamp
 	}
-	fmt.Println("\n🏁 Replay finished.")
 }
 
 type ConnectionHandler struct {
@@ -330,27 +304,13 @@ func (ch *ConnectionHandler) Handle() {
 func getUUID() string {
 	home, _ := os.UserHomeDir()
 	configPath := filepath.Join(home, configFileName)
-	data, err := os.ReadFile(configPath)
-	if err == nil { return strings.TrimSpace(string(data)) }
-	fmt.Print("No UUID found. Please paste your UUID: ")
-	reader := bufio.NewReader(os.Stdin)
-	input, _ := reader.ReadString('\n')
-	input = strings.TrimSpace(input)
-	if input == "" { os.Exit(1) }
+	data, _ := os.ReadFile(configPath)
+	if len(data) > 0 { return strings.TrimSpace(string(data)) }
+	fmt.Print("Paste UUID: ")
+	var input string
+	fmt.Scanln(&input)
 	os.WriteFile(configPath, []byte(input), 0600)
 	return input
-}
-
-func init() {
-	flag.StringVar(&host, "host", defaultHost, "IP to listen on")
-	flag.StringVar(&port, "port", defaultPort, "Port to listen on")
-	flag.StringVar(&apiUrl, "url", defaultAPIUrl, "Web API URL")
-	flag.StringVar(&uuid, "uuid", "", "Your UUID")
-	flag.BoolVar(&verbose, "v", defaultVerbose, "Verbose logging")
-	flag.BoolVar(&reset, "reset", false, "Clear UUID")
-	flag.StringVar(&recordFile, "record", "", "Record session ('auto' or filename)")
-	flag.StringVar(&replayFile, "replay", "", "Replay file")
-	flag.Float64Var(&replaySpeed, "speed", 1.0, "Replay speed")
 }
 
 func main() {
@@ -358,11 +318,11 @@ func main() {
 	if reset {
 		home, _ := os.UserHomeDir()
 		os.Remove(filepath.Join(home, configFileName))
-		fmt.Println("UUID Reset.")
 	}
-	if uuid == "" { uuid = getUUID() }
+	u := uuid
+	if u == "" { u = getUUID() }
 
-	batcher := NewEventBatcher(uuid, apiUrl, verbose, recordFile)
+	batcher := NewEventBatcher(u, apiUrl, verbose, recordFile)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -376,23 +336,10 @@ func main() {
 		go ReplaySession(replayFile, batcher, replaySpeed)
 	}
 
-	address := net.JoinHostPort(host, port)
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		fmt.Printf("Fatal Error: %v\n", err)
-		return
-	}
-	defer listener.Close()
-
+	l, _ := net.Listen("tcp", net.JoinHostPort(host, port))
 	fmt.Printf("--- BAR Relay Active ---\n")
-	if replayFile == "" {
-		fmt.Printf("📡 Listening on: %s\n", address)
-	}
-
 	for {
-		conn, err := listener.Accept()
-		if err != nil { continue }
-		handler := &ConnectionHandler{conn: conn, batcher: batcher}
-		go handler.Handle()
+		conn, _ := l.Accept()
+		go (&ConnectionHandler{conn: conn, batcher: batcher}).Handle()
 	}
 }
