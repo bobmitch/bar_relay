@@ -45,26 +45,27 @@ type retryItem struct {
 }
 
 type EventBatcher struct {
-	mu             sync.Mutex
-	buffer         []map[string]interface{}
-	idleTimer      *time.Timer
-	batchTimer     *time.Timer
-	isInBatchMode  bool
-	softTimeout    time.Duration
-	hardTimeout    time.Duration
-	uuid           string
-	apiUrl         string
-	apiClient      *http.Client
-	verbose        bool
-	startTime      time.Time
-	totalEvents    int64
-	totalRequests  int64
-	totalBytes     int64
-	droppedEvents  int64
-	recorder       *json.Encoder
-	recordMu       sync.Mutex
-	retryQueue     []retryItem
-	retryMu        sync.Mutex
+	mu            sync.Mutex
+	buffer        []map[string]interface{}
+	idleTimer     *time.Timer
+	batchTimer    *time.Timer
+	isInBatchMode bool
+	softTimeout   time.Duration
+	hardTimeout   time.Duration
+	uuid          string
+	apiUrl        string
+	apiClient     *http.Client
+	verbose       bool
+	startTime     time.Time
+	totalEvents   int64
+	totalRequests int64
+	totalBytes    int64
+	droppedEvents int64
+	invalidEvents int64 // TRACKING JSON ERRORS
+	recorder      *json.Encoder
+	recordMu      sync.Mutex
+	retryQueue    []retryItem
+	retryMu       sync.Mutex
 }
 
 // --- Logic ---
@@ -131,9 +132,18 @@ func (b *EventBatcher) retryWorker() {
 
 func (b *EventBatcher) Add(jsonStr string) {
 	var data map[string]interface{}
+	// FIX: Report JSON unmarshalling errors
 	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+		b.mu.Lock()
+		b.invalidEvents++
+		b.mu.Unlock()
+
+		if b.verbose {
+			fmt.Printf("\n[!] JSON Parse Error: %v | Input: %q\n", err, jsonStr)
+		}
 		return
 	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.totalEvents++
@@ -255,6 +265,9 @@ func (b *EventBatcher) PrintFinalSummary() {
 	if b.droppedEvents > 0 {
 		fmt.Printf("🗑️  Dropped:  %d (stale)\n", b.droppedEvents)
 	}
+	if b.invalidEvents > 0 {
+		fmt.Printf("❌ Invalid:  %d (JSON errors)\n", b.invalidEvents)
+	}
 	fmt.Println("--------------------------")
 }
 
@@ -314,7 +327,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Updated Replay logic to use Reader for large files
+	// Updated Replay logic to handle unmarshal errors
 	if replayFile != "" {
 		go func() {
 			f, err := os.Open(replayFile)
@@ -333,6 +346,12 @@ func main() {
 				}
 				var rec RecordedEvent
 				if err := json.Unmarshal([]byte(line), &rec); err != nil {
+					batcher.mu.Lock()
+					batcher.invalidEvents++
+					batcher.mu.Unlock()
+					if verbose {
+						fmt.Printf("\n[!] Replay JSON Error: %v | Line: %q\n", err, line)
+					}
 					continue
 				}
 				if !last.IsZero() {
@@ -359,7 +378,6 @@ func main() {
 		if err == nil {
 			go func(c net.Conn) {
 				defer c.Close()
-				// Updated Connection Handler to use bufio.Reader
 				reader := bufio.NewReader(c)
 				for {
 					line, err := reader.ReadString('\n')
