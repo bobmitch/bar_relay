@@ -320,7 +320,10 @@ func main() {
 
 	// Shutdown handling
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Adding os.Interrupt ensures Ctrl+C is caught reliably on Windows
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGINT, syscall.SIGTERM) 
+
 	go func() {
 		<-sigChan
 		batcher.PrintFinalSummary()
