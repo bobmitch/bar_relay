@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -19,16 +20,16 @@ import (
 
 // Global Config & Stats
 var (
-	host          string
-	port          string
-	apiUrl        string
-	uuid          string
-	verbose       bool
-	reset         bool
-	recordFile    string
-	replayFile    string
-	replaySpeed   float64
-	apiClient     = &http.Client{Timeout: 5 * time.Second}
+	host           string
+	port           string
+	apiUrl         string
+	uuid           string
+	verbose        bool
+	reset          bool
+	recordFile     string
+	replayFile     string
+	replaySpeed    float64
+	apiClient      = &http.Client{Timeout: 5 * time.Second}
 	configFileName = ".bar_uuid"
 	maxRetryAge    = 60 * time.Second
 )
@@ -147,11 +148,15 @@ func (b *EventBatcher) Add(jsonStr string) {
 
 	if len(b.buffer) == 1 {
 		b.isInBatchMode = false
-		if b.idleTimer != nil { b.idleTimer.Stop() }
+		if b.idleTimer != nil {
+			b.idleTimer.Stop()
+		}
 		b.idleTimer = time.AfterFunc(b.softTimeout, b.onSoftTimeout)
 	} else if !b.isInBatchMode {
 		b.isInBatchMode = true
-		if b.idleTimer != nil { b.idleTimer.Stop() }
+		if b.idleTimer != nil {
+			b.idleTimer.Stop()
+		}
 		if b.batchTimer == nil {
 			b.batchTimer = time.AfterFunc(b.hardTimeout, b.onHardTimeout)
 		}
@@ -161,7 +166,9 @@ func (b *EventBatcher) Add(jsonStr string) {
 func (b *EventBatcher) onSoftTimeout() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.buffer) == 0 { return }
+	if len(b.buffer) == 0 {
+		return
+	}
 	if len(b.buffer) == 1 {
 		b.flushUnsafe()
 	} else {
@@ -179,12 +186,22 @@ func (b *EventBatcher) onHardTimeout() {
 }
 
 func (b *EventBatcher) flushUnsafe() {
-	if len(b.buffer) == 0 { return }
-	if b.idleTimer != nil { b.idleTimer.Stop(); b.idleTimer = nil }
-	if b.batchTimer != nil { b.batchTimer.Stop(); b.batchTimer = nil }
+	if len(b.buffer) == 0 {
+		return
+	}
+	if b.idleTimer != nil {
+		b.idleTimer.Stop()
+		b.idleTimer = nil
+	}
+	if b.batchTimer != nil {
+		b.batchTimer.Stop()
+		b.batchTimer = nil
+	}
 
-	for i := range b.buffer { b.buffer[i]["uuid"] = b.uuid }
-	
+	for i := range b.buffer {
+		b.buffer[i]["uuid"] = b.uuid
+	}
+
 	var payload []byte
 	if len(b.buffer) == 1 {
 		payload, _ = json.Marshal(b.buffer[0])
@@ -202,9 +219,11 @@ func (b *EventBatcher) flushUnsafe() {
 
 func (b *EventBatcher) sendToAPI(p []byte, retry bool) {
 	req, err := http.NewRequest("POST", b.apiUrl, bytes.NewBuffer(p))
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	req.Header.Set("Content-Type", "application/json")
-	
+
 	resp, err := apiClient.Do(req)
 	if err != nil || (resp != nil && resp.StatusCode >= 400) {
 		if !retry {
@@ -212,7 +231,9 @@ func (b *EventBatcher) sendToAPI(p []byte, retry bool) {
 			b.retryQueue = append(b.retryQueue, retryItem{payload: p, timestamp: time.Now()})
 			b.retryMu.Unlock()
 		}
-		if resp != nil { resp.Body.Close() }
+		if resp != nil {
+			resp.Body.Close()
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -221,7 +242,7 @@ func (b *EventBatcher) sendToAPI(p []byte, retry bool) {
 	b.totalRequests++
 	b.totalBytes += int64(len(p))
 	b.mu.Unlock()
-	
+
 	if b.verbose {
 		fmt.Printf("\n[v] Sent %d bytes (Status: %d)\n", len(p), resp.StatusCode)
 	}
@@ -231,7 +252,9 @@ func (b *EventBatcher) PrintFinalSummary() {
 	kb := float64(b.totalBytes) / 1024.0
 	fmt.Println("\n\n--- 🏁 Session Summary ---")
 	fmt.Printf("📈 Events:   %d\n🌐 Requests: %d\n💾 Data:     %.2f KB\n", b.totalEvents, b.totalRequests, kb)
-	if b.droppedEvents > 0 { fmt.Printf("🗑️  Dropped:  %d (stale)\n", b.droppedEvents) }
+	if b.droppedEvents > 0 {
+		fmt.Printf("🗑️  Dropped:  %d (stale)\n", b.droppedEvents)
+	}
 	fmt.Println("--------------------------")
 }
 
@@ -239,7 +262,9 @@ func getUUID() string {
 	home, _ := os.UserHomeDir()
 	path := filepath.Join(home, configFileName)
 	data, _ := os.ReadFile(path)
-	if len(data) > 0 { return strings.TrimSpace(string(data)) }
+	if len(data) > 0 {
+		return strings.TrimSpace(string(data))
+	}
 	fmt.Print("🔑 Paste UUID: ")
 	var input string
 	fmt.Scanln(&input)
@@ -274,7 +299,9 @@ func main() {
 	}
 
 	u := uuid
-	if u == "" { u = getUUID() }
+	if u == "" {
+		u = getUUID()
+	}
 
 	batcher := NewEventBatcher(u, apiUrl, verbose, recordFile)
 
@@ -287,15 +314,27 @@ func main() {
 		os.Exit(0)
 	}()
 
+	// Updated Replay logic to use Reader for large files
 	if replayFile != "" {
 		go func() {
-			f, _ := os.Open(replayFile)
+			f, err := os.Open(replayFile)
+			if err != nil {
+				fmt.Printf("❌ Replay error: %v\n", err)
+				return
+			}
 			defer f.Close()
-			scanner := bufio.NewScanner(f)
+
+			reader := bufio.NewReader(f)
 			var last time.Time
-			for scanner.Scan() {
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					break
+				}
 				var rec RecordedEvent
-				json.Unmarshal(scanner.Bytes(), &rec)
+				if err := json.Unmarshal([]byte(line), &rec); err != nil {
+					continue
+				}
 				if !last.IsZero() {
 					time.Sleep(time.Duration(float64(rec.Timestamp.Sub(last)) / replaySpeed))
 				}
@@ -314,14 +353,29 @@ func main() {
 		return
 	}
 	fmt.Printf("📡 BAR Relay: %s\n", addr)
+
 	for {
 		conn, err := l.Accept()
 		if err == nil {
 			go func(c net.Conn) {
 				defer c.Close()
-				s := bufio.NewScanner(c)
-				for s.Scan() {
-					batcher.Add(s.Text())
+				// Updated Connection Handler to use bufio.Reader
+				reader := bufio.NewReader(c)
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						if err != io.EOF && verbose {
+							fmt.Printf("\n[!] Conn Error: %v\n", err)
+						}
+						break
+					}
+
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
+					}
+
+					batcher.Add(line)
 					c.Write([]byte("ACK\n"))
 				}
 			}(conn)
