@@ -6,354 +6,325 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
+// Global Config & Stats
 var (
-	defaultHost    = "127.0.0.1"
-	defaultPort    = "5005"
-	defaultAPIUrl  = "https://barapi.bobmitch.com/push"
-	defaultVerbose = false
+	host          string
+	port          string
+	apiUrl        string
+	uuid          string
+	verbose       bool
+	reset         bool
+	recordFile    string
+	replayFile    string
+	replaySpeed   float64
+	apiClient     = &http.Client{Timeout: 5 * time.Second}
+	configFileName = ".bar_uuid"
+	maxRetryAge    = 60 * time.Second
 )
 
-var (
-	host    string
-	port    string
-	apiUrl  string
-	uuid    string
-	verbose bool
-	reset   bool
-)
-
-var apiClient = &http.Client{
-	Timeout: 10 * time.Second,
+type RecordedEvent struct {
+	Timestamp time.Time              `json:"t"`
+	Data      map[string]interface{} `json:"d"`
 }
 
-const configFileName = ".bar_uuid"
+type retryItem struct {
+	payload   []byte
+	timestamp time.Time
+}
 
-// EventBatcher handles intelligent batching of events
 type EventBatcher struct {
-	mu              sync.Mutex
-	buffer          []map[string]interface{}
-	
-	idleTimer       *time.Timer      // Soft timeout: send isolated events quickly
-	batchTimer      *time.Timer      // Hard timeout: force flush during saturation
-	
-	firstEventTime  time.Time
-	isInBatchMode   bool
-	
-	// Configuration (tuned for game dynamics)
-	softTimeout     time.Duration    // 100ms: detect if more events coming
-	hardTimeout     time.Duration    // 250ms: maximum batch wait during saturation
-	
-	// Context
-	uuid            string
-	apiUrl          string
-	apiClient       *http.Client
-	verbose         bool
+	mu             sync.Mutex
+	buffer         []map[string]interface{}
+	idleTimer      *time.Timer
+	batchTimer     *time.Timer
+	isInBatchMode  bool
+	softTimeout    time.Duration
+	hardTimeout    time.Duration
+	uuid           string
+	apiUrl         string
+	apiClient      *http.Client
+	verbose        bool
+	startTime      time.Time
+	totalEvents    int64
+	totalRequests  int64
+	totalBytes     int64
+	droppedEvents  int64
+	recorder       *json.Encoder
+	recordMu       sync.Mutex
+	retryQueue     []retryItem
+	retryMu        sync.Mutex
 }
 
-func NewEventBatcher(uuid, apiUrl string, verbose bool) *EventBatcher {
-	return &EventBatcher{
+// --- Logic ---
+
+func NewEventBatcher(u, url string, v bool, recPath string) *EventBatcher {
+	eb := &EventBatcher{
 		buffer:      make([]map[string]interface{}, 0),
 		softTimeout: 100 * time.Millisecond,
 		hardTimeout: 250 * time.Millisecond,
-		uuid:        uuid,
-		apiUrl:      apiUrl,
+		uuid:        u,
+		apiUrl:      url,
 		apiClient:   apiClient,
-		verbose:     verbose,
+		verbose:     v,
+		startTime:   time.Now(),
+		retryQueue:  make([]retryItem, 0),
+	}
+
+	if recPath != "" {
+		if recPath == "auto" {
+			recPath = fmt.Sprintf("session_%s.jsonl", time.Now().Format("2006-01-02_15-04-05"))
+		}
+		f, err := os.OpenFile(recPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Printf("⚠️  Record error: %v\n", err)
+		} else {
+			eb.recorder = json.NewEncoder(f)
+			fmt.Printf("📂 Recording to: %s\n", recPath)
+		}
+	}
+	go eb.retryWorker()
+	return eb
+}
+
+func (b *EventBatcher) retryWorker() {
+	for {
+		time.Sleep(5 * time.Second)
+		b.retryMu.Lock()
+		if len(b.retryQueue) == 0 {
+			b.retryMu.Unlock()
+			continue
+		}
+		var valid []retryItem
+		now := time.Now()
+		for _, item := range b.retryQueue {
+			if now.Sub(item.timestamp) < maxRetryAge {
+				valid = append(valid, item)
+			} else {
+				b.mu.Lock()
+				b.droppedEvents++
+				b.mu.Unlock()
+			}
+		}
+		b.retryQueue = valid
+		if len(b.retryQueue) > 0 {
+			item := b.retryQueue[0]
+			b.retryQueue = b.retryQueue[1:]
+			b.retryMu.Unlock()
+			b.sendToAPI(item.payload, true)
+		} else {
+			b.retryMu.Unlock()
+		}
 	}
 }
 
-// Add adds an event to the batcher and manages timing
-func (b *EventBatcher) Add(eventJSON string) {
+func (b *EventBatcher) Add(jsonStr string) {
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+		return
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.totalEvents++
 
-	var event map[string]interface{}
-	if err := json.Unmarshal([]byte(eventJSON), &event); err != nil {
-		fmt.Printf("Error parsing event JSON: %v\n", err)
-		return
+	if b.recorder != nil {
+		b.recordMu.Lock()
+		b.recorder.Encode(RecordedEvent{Timestamp: time.Now(), Data: data})
+		b.recordMu.Unlock()
 	}
 
-	// First event in buffer
-	if len(b.buffer) == 0 {
-		b.firstEventTime = time.Now()
+	b.buffer = append(b.buffer, data)
+
+	if len(b.buffer) == 1 {
 		b.isInBatchMode = false
-		b.buffer = append(b.buffer, event)
-
-		if b.verbose {
-			fmt.Printf("[Batcher] First event received, starting soft timer (100ms)\n")
-		}
-
-		// Start soft timer to detect isolated vs persistent events
-		if b.idleTimer != nil {
-			b.idleTimer.Stop()
-		}
+		if b.idleTimer != nil { b.idleTimer.Stop() }
 		b.idleTimer = time.AfterFunc(b.softTimeout, b.onSoftTimeout)
-		return
-	}
-
-	// Subsequent events
-	b.buffer = append(b.buffer, event)
-
-	// If in soft window (< 100ms) and now have 2+ events, transition to batch mode
-	if !b.isInBatchMode && time.Since(b.firstEventTime) < b.softTimeout {
-		if len(b.buffer) >= 2 {
-			if b.verbose {
-				fmt.Printf("[Batcher] Multiple events detected during soft window, switching to batch mode\n")
-			}
-			b.isInBatchMode = true
-			// Stop soft timer and start hard timer
-			if b.idleTimer != nil {
-				b.idleTimer.Stop()
-			}
+	} else if !b.isInBatchMode {
+		b.isInBatchMode = true
+		if b.idleTimer != nil { b.idleTimer.Stop() }
+		if b.batchTimer == nil {
 			b.batchTimer = time.AfterFunc(b.hardTimeout, b.onHardTimeout)
 		}
 	}
-
-	// If in batch mode, refresh the hard timer (keep extending deadline while events arrive)
-	if b.isInBatchMode {
-		if b.batchTimer != nil {
-			b.batchTimer.Stop()
-		}
-		b.batchTimer = time.AfterFunc(b.hardTimeout, b.onHardTimeout)
-	}
 }
 
-// onSoftTimeout fires when 100ms passes in soft window
-// Decision: single event? send immediately. multiple? switch to batch mode
 func (b *EventBatcher) onSoftTimeout() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	if len(b.buffer) == 0 {
-		return
-	}
-
-	if b.verbose {
-		fmt.Printf("[Batcher] Soft timeout fired. Buffer size: %d\n", len(b.buffer))
-	}
-
-	// Only 1 event: send it immediately (isolated event)
+	if len(b.buffer) == 0 { return }
 	if len(b.buffer) == 1 {
-		if b.verbose {
-			fmt.Printf("[Batcher] Single event, sending immediately\n")
-		}
 		b.flushUnsafe()
-		return
+	} else {
+		b.isInBatchMode = true
+		if b.batchTimer == nil {
+			b.batchTimer = time.AfterFunc(b.hardTimeout, b.onHardTimeout)
+		}
 	}
-
-	// Multiple events: switch to batch mode with hard timeout
-	if b.verbose {
-		fmt.Printf("[Batcher] Multiple events detected, entering batch mode with 250ms deadline\n")
-	}
-	b.isInBatchMode = true
-	b.batchTimer = time.AfterFunc(b.hardTimeout, b.onHardTimeout)
 }
 
-// onHardTimeout fires when 250ms passes during batch mode
-// Force flush regardless of incoming events
 func (b *EventBatcher) onHardTimeout() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	if len(b.buffer) > 0 {
-		if b.verbose {
-			fmt.Printf("[Batcher] Hard timeout fired, flushing %d events\n", len(b.buffer))
-		}
-		b.flushUnsafe()
-	}
+	b.flushUnsafe()
 }
 
-// flushUnsafe sends buffered events to API (must hold mutex)
 func (b *EventBatcher) flushUnsafe() {
-	if len(b.buffer) == 0 {
-		return
-	}
+	if len(b.buffer) == 0 { return }
+	if b.idleTimer != nil { b.idleTimer.Stop(); b.idleTimer = nil }
+	if b.batchTimer != nil { b.batchTimer.Stop(); b.batchTimer = nil }
 
-	// Stop any pending timers
-	if b.idleTimer != nil {
-		b.idleTimer.Stop()
-		b.idleTimer = nil
-	}
-	if b.batchTimer != nil {
-		b.batchTimer.Stop()
-		b.batchTimer = nil
-	}
-
-	// Add UUID to all events
-	for i := range b.buffer {
-		b.buffer[i]["uuid"] = b.uuid
-	}
-
-	// Determine payload format
+	for i := range b.buffer { b.buffer[i]["uuid"] = b.uuid }
+	
 	var payload []byte
 	if len(b.buffer) == 1 {
-		// Single event: send as object
 		payload, _ = json.Marshal(b.buffer[0])
-		if b.verbose {
-			fmt.Printf("[Batcher] Sending single event: %s\n", string(payload))
-		}
 	} else {
-		// Multiple events: send as array
 		payload, _ = json.Marshal(b.buffer)
-		if b.verbose {
-			fmt.Printf("[Batcher] Sending batch of %d events\n", len(b.buffer))
-		}
 	}
 
-	b.sendToAPI(payload)
-
-	// Clear buffer and reset state
+	go b.sendToAPI(payload, false)
 	b.buffer = make([]map[string]interface{}, 0)
 	b.isInBatchMode = false
+
+	kb := float64(b.totalBytes) / 1024.0
+	fmt.Printf("\r🚀 [Relay] Events: %-6d | Req: %-4d | Sent: %-7.2f KB", b.totalEvents, b.totalRequests, kb)
 }
 
-// sendToAPI performs the HTTP POST to the PHP endpoint
-func (b *EventBatcher) sendToAPI(payload []byte) {
-	req, err := http.NewRequest("POST", b.apiUrl, bytes.NewBuffer(payload))
-	if err != nil {
-		fmt.Printf("Request Creation Error: %v\n", err)
-		return
-	}
-
+func (b *EventBatcher) sendToAPI(p []byte, retry bool) {
+	req, err := http.NewRequest("POST", b.apiUrl, bytes.NewBuffer(p))
+	if err != nil { return }
 	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := b.apiClient.Do(req)
-	if err != nil {
-		fmt.Printf("API Error: %v\n", err)
+	
+	resp, err := apiClient.Do(req)
+	if err != nil || (resp != nil && resp.StatusCode >= 400) {
+		if !retry {
+			b.retryMu.Lock()
+			b.retryQueue = append(b.retryQueue, retryItem{payload: p, timestamp: time.Now()})
+			b.retryMu.Unlock()
+		}
+		if resp != nil { resp.Body.Close() }
 		return
 	}
 	defer resp.Body.Close()
 
-	if b.verbose || resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		fmt.Printf("API Response (%d): %s\n", resp.StatusCode, string(body))
+	b.mu.Lock()
+	b.totalRequests++
+	b.totalBytes += int64(len(p))
+	b.mu.Unlock()
+	
+	if b.verbose {
+		fmt.Printf("\n[v] Sent %d bytes (Status: %d)\n", len(p), resp.StatusCode)
 	}
 }
 
-// ConnectionHandler manages a single connection from LUA widget
-type ConnectionHandler struct {
-	conn    net.Conn
-	batcher *EventBatcher
-	verbose bool
+func (b *EventBatcher) PrintFinalSummary() {
+	kb := float64(b.totalBytes) / 1024.0
+	fmt.Println("\n\n--- 🏁 Session Summary ---")
+	fmt.Printf("📈 Events:   %d\n🌐 Requests: %d\n💾 Data:     %.2f KB\n", b.totalEvents, b.totalRequests, kb)
+	if b.droppedEvents > 0 { fmt.Printf("🗑️  Dropped:  %d (stale)\n", b.droppedEvents) }
+	fmt.Println("--------------------------")
 }
 
-func NewConnectionHandler(conn net.Conn, batcher *EventBatcher, verbose bool) *ConnectionHandler {
-	return &ConnectionHandler{
-		conn:    conn,
-		batcher: batcher,
-		verbose: verbose,
-	}
-}
-
-func (ch *ConnectionHandler) Handle() {
-	defer ch.conn.Close()
-	fmt.Printf("New connection from: %s\n", ch.conn.RemoteAddr())
-
-	scanner := bufio.NewScanner(ch.conn)
-	for scanner.Scan() {
-		jsonData := scanner.Text()
-
-		if ch.verbose {
-			fmt.Printf("Received: %s\n", jsonData)
-		}
-
-		// Add to batcher (handles intelligent buffering)
-		ch.batcher.Add(jsonData)
-
-		// Send ACK to LUA
-		ch.conn.Write([]byte("ACK\n"))
-	}
-
-	if err := scanner.Err(); err != nil {
-		fmt.Printf("Connection error: %v\n", err)
-	}
-	fmt.Printf("Connection closed for: %s\n", ch.conn.RemoteAddr())
-}
-
-// UUID Management
 func getUUID() string {
 	home, _ := os.UserHomeDir()
-	configPath := filepath.Join(home, configFileName)
-
-	data, err := os.ReadFile(configPath)
-	if err == nil {
-		return strings.TrimSpace(string(data))
-	}
-
-	fmt.Print("No UUID found. Please paste your UUID: ")
-	reader := bufio.NewReader(os.Stdin)
-	input, _ := reader.ReadString('\n')
-	input = strings.TrimSpace(input)
-
-	if input == "" {
-		fmt.Println("Error: UUID cannot be empty.")
-		os.Exit(1)
-	}
-
-	os.WriteFile(configPath, []byte(input), 0600)
-	fmt.Printf("UUID saved to %s\n", configPath)
-
+	path := filepath.Join(home, configFileName)
+	data, _ := os.ReadFile(path)
+	if len(data) > 0 { return strings.TrimSpace(string(data)) }
+	fmt.Print("🔑 Paste UUID: ")
+	var input string
+	fmt.Scanln(&input)
+	os.WriteFile(path, []byte(input), 0600)
 	return input
 }
 
-func init() {
-	flag.StringVar(&host, "host", defaultHost, "The IP address to listen on")
-	flag.StringVar(&port, "port", defaultPort, "The TCP port to listen on")
-	flag.StringVar(&apiUrl, "url", defaultAPIUrl, "The destination Web API URL")
-	flag.StringVar(&uuid, "uuid", "", "Your UUID from the web app")
-	flag.BoolVar(&verbose, "v", defaultVerbose, "Enable detailed logging")
-	flag.BoolVar(&reset, "reset", false, "Clear the stored UUID and prompt for a new one")
-}
-
 func main() {
+	// 1. Setup Flags
+	flag.StringVar(&host, "host", "127.0.0.1", "IP to listen on")
+	flag.StringVar(&port, "port", "5005", "Port to listen on")
+	flag.StringVar(&apiUrl, "url", "https://barapi.bobmitch.com/push", "Web API URL")
+	flag.StringVar(&uuid, "uuid", "", "Your unique UUID")
+	flag.BoolVar(&verbose, "v", false, "Enable verbose logging")
+	flag.BoolVar(&reset, "reset", false, "Reset stored UUID")
+	flag.StringVar(&recordFile, "record", "", "Record to file (or 'auto')")
+	flag.StringVar(&replayFile, "replay", "", "Replay a .jsonl file")
+	flag.Float64Var(&replaySpeed, "speed", 1.0, "Replay speed (e.g. 2.0)")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage of BAR Relay:\n")
+		flag.PrintDefaults()
+	}
+
 	flag.Parse()
 
+	// 2. Logic
 	if reset {
 		home, _ := os.UserHomeDir()
 		os.Remove(filepath.Join(home, configFileName))
-		fmt.Println("Stored UUID cleared.")
+		fmt.Println("✅ UUID cleared.")
 	}
 
-	if uuid == "" {
-		uuid = getUUID()
+	u := uuid
+	if u == "" { u = getUUID() }
+
+	batcher := NewEventBatcher(u, apiUrl, verbose, recordFile)
+
+	// Shutdown handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		batcher.PrintFinalSummary()
+		os.Exit(0)
+	}()
+
+	if replayFile != "" {
+		go func() {
+			f, _ := os.Open(replayFile)
+			defer f.Close()
+			scanner := bufio.NewScanner(f)
+			var last time.Time
+			for scanner.Scan() {
+				var rec RecordedEvent
+				json.Unmarshal(scanner.Bytes(), &rec)
+				if !last.IsZero() {
+					time.Sleep(time.Duration(float64(rec.Timestamp.Sub(last)) / replaySpeed))
+				}
+				raw, _ := json.Marshal(rec.Data)
+				batcher.Add(string(raw))
+				last = rec.Timestamp
+			}
+			fmt.Println("\n🏁 Replay finished.")
+		}()
 	}
 
-	// Create shared batcher for all connections
-	batcher := NewEventBatcher(uuid, apiUrl, verbose)
-
-	address := net.JoinHostPort(host, port)
-	listener, err := net.Listen("tcp", address)
+	addr := net.JoinHostPort(host, port)
+	l, err := net.Listen("tcp", addr)
 	if err != nil {
-		fmt.Printf("Error: Could not start server: %v\n", err)
+		fmt.Printf("❌ Fatal: %v\n", err)
 		return
 	}
-	defer listener.Close()
-
-	fmt.Printf("--- BAR Relay Active ---\n")
-	fmt.Printf("Listening on: %s\n", address)
-	fmt.Printf("Relaying to : %s\n", apiUrl)
-	fmt.Printf("Batching    : Soft timeout=100ms, Hard timeout=250ms\n")
-	fmt.Printf("Verbose     : %v\n", verbose)
-	fmt.Println("------------------------")
-
+	fmt.Printf("📡 BAR Relay: %s\n", addr)
 	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			fmt.Printf("Accept error: %v\n", err)
-			continue
+		conn, err := l.Accept()
+		if err == nil {
+			go func(c net.Conn) {
+				defer c.Close()
+				s := bufio.NewScanner(c)
+				for s.Scan() {
+					batcher.Add(s.Text())
+					c.Write([]byte("ACK\n"))
+				}
+			}(conn)
 		}
-		
-		handler := NewConnectionHandler(conn, batcher, verbose)
-		go handler.Handle()
 	}
 }
