@@ -7,6 +7,10 @@ A high-performance Go-based relay for **Beyond All Reason (BAR)**. This tool acc
 
 Download the [latest](https://github.com/bobmitch/bar_relay/tags) binary and run it.
 
+## Discussion
+
+[Discord Channel](https://discord.gg/NK7QWfVE9M)
+
 ## 🚀 Features
 
 * **Intelligent Batching**: Groups rapid-fire game events into single HTTP requests using soft (100ms) and hard (250ms) timeouts.
