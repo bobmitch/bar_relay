@@ -3,6 +3,10 @@
 
 A high-performance Go-based relay for **Beyond All Reason (BAR)**. This tool accepts JSON events from the game via TCP, batches them intelligently to save bandwidth, and relays them to a web API. It also features a session recorder and a time-accurate replayer.
 
+## Quick Start
+
+Download the [latest](https://github.com/bobmitch/bar_relay/tags) binary and run it.
+
 ## 🚀 Features
 
 * **Intelligent Batching**: Groups rapid-fire game events into single HTTP requests using soft (100ms) and hard (250ms) timeouts.
