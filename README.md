@@ -1,4 +1,13 @@
 
+## 🛠 Related Repositories
+This project is part of a suite of tools. You can find the related components below:
+
+| Repository | Purpose |
+| :--- | :--- |
+| [**bar**](https://github.com/bobmitch/bar) | Core application logic and main service. |
+| [**bar_relay**](https://github.com/bobmitch/bar_relay) | JSON layer/proxy for passing game events to the internet. |
+| [**bar_eventwidget**](https://github.com/bobmitch/bar_eventwidget) | LUA -> JSON conversion and local transmission. |
+
 # BAR Event Relay & Recorder
 
 A high-performance Go-based relay for **Beyond All Reason (BAR)**. This tool accepts JSON events from the game via TCP, batches them intelligently to save bandwidth, and relays them to a web API. It also features a session recorder and a time-accurate replayer.
